@@ -2,13 +2,19 @@
 // Misma arquitectura: vídeo cargado como Blob, seeks con cola, bucle rAF con
 // lerp que se detiene al estabilizarse, IntersectionObserver y scroll pasivo.
 
-// Escritorio: el original, sin cambios respecto a antes de este trabajo.
+// Escritorio (ratón): vídeo con seeks, como siempre.
 export const HERO_VIDEO_URL = "/video/hero-scrub.mp4";
-// Móvil: mismo contenido a menor resolución (854×480), para comprobar si el
-// coste de cada búsqueda depende de los píxeles a decodificar. Se elige una
-// sola vez al iniciar (ver isCoarsePointer más abajo), nunca a mitad de
-// sesión, para no volver a descargar el vídeo si la ventana cambia de tamaño.
-export const HERO_VIDEO_URL_MOBILE = "/video/hero-scrub-480.mp4";
+// Móvil / táctil: NO se usa vídeo. Se usa una secuencia de 120 imágenes WebP
+// (1 de cada 2 fotogramas del vídeo, 854×480, ~680 KB en total) pintadas en un
+// <canvas>. Motivo: en el navegador interno de Instagram (y otros WebViews de
+// iOS) el <video> no llega a pintar fotogramas al hacer seek sin un toque del
+// usuario, así que el coche se quedaba congelado mientras los textos se movían.
+// Las imágenes cargan y se pintan en cualquier navegador, sin políticas de
+// reproducción. Entre dos fotogramas se hace un fundido para que el scroll
+// lento se vea continuo.
+export const HERO_FRAME_COUNT = 120;
+export const heroFrameUrl = (i: number) =>
+  `/video/hero-frames/f${String(i + 1).padStart(3, "0")}.webp`;
 export const HERO_POSTER_URL = "/images/hero-poster.jpg";
 export const HERO_ENDING_URL = "/images/hero-ending.jpg";
 
@@ -76,7 +82,9 @@ export function initHeroScrub({ heroPin, stage, video, poster, scrollCue }: Hero
   // mitad de sesión por girar el móvil o redimensionar la ventana.
   const isCoarsePointer =
     typeof matchMedia === "function" && matchMedia("(pointer: coarse)").matches;
-  const videoUrl = isCoarsePointer ? HERO_VIDEO_URL_MOBILE : HERO_VIDEO_URL;
+  // Táctil → secuencia de imágenes en canvas. Ratón → vídeo.
+  const useFrames = isCoarsePointer;
+  const videoUrl = HERO_VIDEO_URL;
 
   const debugMode =
     typeof location !== "undefined" && new URLSearchParams(location.search).get("debug") === "1";
@@ -124,6 +132,10 @@ export function initHeroScrub({ heroPin, stage, video, poster, scrollCue }: Hero
   function startLoad() {
     if (started) return;
     started = true;
+    if (useFrames) {
+      startFrames();
+      return;
+    }
     fetch(videoUrl, { signal: abort.signal })
       .then((res) => res.blob())
       .then((blob) => {
@@ -142,6 +154,153 @@ export function initHeroScrub({ heroPin, stage, video, poster, scrollCue }: Hero
     body.classList.add("video-failed");
     stage.classList.remove("video-ready");
     poster.style.backgroundImage = `url('${HERO_ENDING_URL}')`;
+  }
+
+  // --- modo fotogramas (táctil): secuencia de imágenes pintada en canvas ---
+  let canvas: HTMLCanvasElement | null = null;
+  let ctx: CanvasRenderingContext2D | null = null;
+  const frames: (HTMLImageElement | null)[] = new Array(HERO_FRAME_COUNT).fill(null);
+  let framesLoaded = 0;
+  let lastKey = -1; // posición ya pintada; -1 = hay que repintar
+  let posY = 0.5; // equivalente a object-position vertical
+
+  // Orden de carga de grueso a fino (0, 16, 32… luego 8, 24… etc.): a los pocos
+  // KB ya hay fotogramas repartidos por todo el recorrido y el scroll responde
+  // desde el principio; el resto rellena huecos.
+  function loadOrder(n: number) {
+    const order: number[] = [];
+    const seen = new Set<number>();
+    const push = (i: number) => {
+      if (!seen.has(i)) { seen.add(i); order.push(i); }
+    };
+    push(0);
+    push(n - 1);
+    for (const step of [16, 8, 4, 2, 1]) for (let i = 0; i < n; i += step) push(i);
+    return order;
+  }
+
+  function sizeCanvas() {
+    if (!canvas || !ctx) return false;
+    const w = canvas.clientWidth;
+    const h = canvas.clientHeight;
+    if (!w || !h) return false;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const W = Math.round(w * dpr);
+    const H = Math.round(h * dpr);
+    posY = matchMedia("(orientation: portrait)").matches ? 0.5 : 0.4;
+    if (W === canvas.width && H === canvas.height) return false;
+    canvas.width = W; // redimensionar borra el canvas y su estado
+    canvas.height = H;
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    return true;
+  }
+  function onResize() {
+    if (sizeCanvas()) {
+      lastKey = -1;
+      drawFrames(shown);
+    }
+  }
+
+  // Pinta la imagen cubriendo todo el canvas (como object-fit: cover).
+  function paint(img: HTMLImageElement, alpha: number) {
+    if (!ctx || !canvas) return;
+    const W = canvas.width;
+    const H = canvas.height;
+    const iw = img.naturalWidth;
+    const ih = img.naturalHeight;
+    if (!iw || !ih) return;
+    const s = Math.max(W / iw, H / ih);
+    const dw = iw * s;
+    const dh = ih * s;
+    ctx.globalAlpha = alpha;
+    ctx.drawImage(img, (W - dw) / 2, (H - dh) * posY, dw, dh);
+    ctx.globalAlpha = 1;
+  }
+
+  function nearestLoaded(x: number) {
+    const c = Math.round(x);
+    for (let d = 0; d < HERO_FRAME_COUNT; d++) {
+      if (c - d >= 0 && frames[c - d]) return c - d;
+      if (c + d < HERO_FRAME_COUNT && frames[c + d]) return c + d;
+    }
+    return -1;
+  }
+
+  function drawFrames(p: number) {
+    if (!ctx || !canvas || framesLoaded === 0 || !canvas.width) return;
+    const x = clamp(p, 0, 1) * (HERO_FRAME_COUNT - 1);
+    const key = Math.round(x * 200);
+    if (key === lastKey) return;
+    const i = Math.floor(x);
+    const f = x - i;
+    const a = frames[i];
+    const b = frames[Math.min(i + 1, HERO_FRAME_COUNT - 1)];
+    if (a && b) {
+      // Fundido entre el fotograma actual y el siguiente: scroll continuo.
+      paint(a, 1);
+      if (f > 0.02 && b !== a) paint(b, f);
+      lastKey = key;
+    } else {
+      // Aún cargando: el fotograma disponible más cercano, y se repinta
+      // cuando llegue el que falta.
+      const n = nearestLoaded(x);
+      if (n < 0) return;
+      paint(frames[n]!, 1);
+      lastKey = -1;
+    }
+    if (!stage.classList.contains("video-ready")) stage.classList.add("video-ready");
+  }
+
+  function startFrames() {
+    canvas = document.createElement("canvas");
+    canvas.className = "hero-frames";
+    canvas.setAttribute("aria-hidden", "true");
+    video.insertAdjacentElement("afterend", canvas);
+    ctx = canvas.getContext("2d");
+    if (!ctx) {
+      failVideo();
+      return;
+    }
+    sizeCanvas();
+    addEventListener("resize", onResize, { passive: true });
+
+    const queue = loadOrder(HERO_FRAME_COUNT);
+    let active = 0;
+    const pump = () => {
+      while (!disposed && active < 6 && queue.length) {
+        const i = queue.shift()!;
+        active++;
+        const img = new Image();
+        img.decoding = "async";
+        const done = () => {
+          active--;
+          pump();
+        };
+        img.onload = () => {
+          // decode() deja la imagen ya descomprimida para que el primer
+          // drawImage no provoque un tirón; si falla, se usa igualmente.
+          (img.decode ? img.decode() : Promise.resolve())
+            .catch(() => {})
+            .then(() => {
+              if (disposed) return;
+              frames[i] = img;
+              framesLoaded++;
+              if (lastKey === -1) {
+                if (!canvas!.width) sizeCanvas();
+                drawFrames(shown);
+              }
+            })
+            .finally(done);
+        };
+        img.onerror = () => {
+          if (i === 0 && !disposed) failVideo();
+          done();
+        };
+        img.src = heroFrameUrl(i);
+      }
+    };
+    pump();
   }
 
   // --- panel de depuración: solo con ?debug=1, nunca en condiciones normales ---
@@ -181,7 +340,9 @@ export function initHeroScrub({ heroPin, stage, video, poster, scrollCue }: Hero
       `último seek: ${last !== undefined ? last.toFixed(0) + " ms" : "–"}\n` +
       `media (20): ${avg !== undefined ? avg.toFixed(0) + " ms" : "–"}\n` +
       `seeks/s: ${seekCompletions.length}\n` +
-      `vídeo: ${w && h ? `${w}×${h}` : "cargando…"} — ${videoUrl.split("/").pop()}`;
+      (useFrames
+        ? `fotogramas: ${framesLoaded}/${HERO_FRAME_COUNT} (canvas)`
+        : `vídeo: ${w && h ? `${w}×${h}` : "cargando…"} — ${videoUrl.split("/").pop()}`);
   }
   function debugRecordSeekStart() {
     if (!debugMode) return;
@@ -301,7 +462,8 @@ export function initHeroScrub({ heroPin, stage, video, poster, scrollCue }: Hero
     } else {
       rafId = requestAnimationFrame(tick);
     }
-    if (video.duration) requestSeek(shown * video.duration);
+    if (useFrames) drawFrames(shown);
+    else if (video.duration) requestSeek(shown * video.duration);
     updateCaptions(shown, now);
   }
   function onScroll() {
@@ -317,6 +479,8 @@ export function initHeroScrub({ heroPin, stage, video, poster, scrollCue }: Hero
     disposed = true;
     abort.abort();
     removeEventListener("scroll", onScroll);
+    removeEventListener("resize", onResize);
+    canvas?.remove();
     if (rafId !== null) cancelAnimationFrame(rafId);
     debugTeardown();
     io.disconnect();
