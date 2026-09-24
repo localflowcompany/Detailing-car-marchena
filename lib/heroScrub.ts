@@ -409,6 +409,7 @@ export function initHeroScrub({ heroPin, stage, video, poster, scrollCue }: Hero
     (entries) => {
       heroOnScreen = entries[0].isIntersecting;
       body.classList.toggle("hero-passed", !heroOnScreen);
+      if (heroOnScreen && rafId === null && scrubOn) rafId = requestAnimationFrame(tick);
     },
     { threshold: 0 }
   );
@@ -449,7 +450,16 @@ export function initHeroScrub({ heroPin, stage, video, poster, scrollCue }: Hero
   }
 
   // --- bucle rAF: lerp del progreso mostrado hacia el objetivo, y reposo ---
+  // IMPORTANTE: target se lee aquí, en cada fotograma, en vez de solo dentro
+  // del evento "scroll". En el navegador interno de Instagram (y otros
+  // WebViews) el evento "scroll" deja de disparase con regularidad durante el
+  // scroll por inercia (el dedo suelta la pantalla y el sistema operativo
+  // sigue desplazando la página solo): si target solo se actualizaba ahí, el
+  // hero se quedaba congelado esperando el siguiente evento y luego saltaba
+  // de golpe. Leyendo la posición real en cada tick, el hero sigue el scroll
+  // aunque no lleguen eventos "scroll".
   function tick(now: number) {
+    target = heroProgress();
     const dt = Math.min(100, now - (lastTick || now));
     lastTick = now;
     const k = 0.16;
@@ -457,17 +467,20 @@ export function initHeroScrub({ heroPin, stage, video, poster, scrollCue }: Hero
     const stillLoading = now - loadStart < 950;
     if (Math.abs(target - shown) < 0.0005 && !stillLoading) {
       shown = target;
+    }
+    if (heroOnScreen) {
+      rafId = requestAnimationFrame(tick);
+    } else {
       rafId = null;
       lastTick = 0;
-    } else {
-      rafId = requestAnimationFrame(tick);
     }
     if (useFrames) drawFrames(shown);
     else if (video.duration) requestSeek(shown * video.duration);
     updateCaptions(shown, now);
   }
+  // El evento "scroll" ya no fija el objetivo (lo hace tick en cada
+  // fotograma); solo se usa para despertar el bucle si se había parado.
   function onScroll() {
-    target = heroProgress();
     if (rafId === null && heroOnScreen) rafId = requestAnimationFrame(tick);
   }
 
